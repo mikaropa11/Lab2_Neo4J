@@ -1,0 +1,15 @@
+query 1:
+Just one MATCH on LineItem with a filter. No relationships. t's pure single-table aggregation, nothing to 
+traverse. Cypher groups implicitly by whatever non-aggregated stuff is in RETURN, so no GROUP BY needed.
+
+query 2:
+two steps: MATCH ... WITH p, min(ps.PS_SUPPLYCOST), then second MATCH re-joining on ps.PS_SUPPLYCOST = min_supply_cost
+because Cypher has no correlated scalar subquery like SQL, so aggregating in WITH and joining back is the idiomatic way. 
+
+query 3:
+Start from Customer filtered by segment -> PLACED -> Order (date filter) -> CONTAINS -> LineItem (date filter). Group by orderkey and o.
+We start filtering customer to prune the most before any expansion
+
+query 4:
+start from date-filtered Order, traverse to Customer and Supplier, check c.C_NATIONKEY = s.S_NATIONKEY as property comparison, and reach Nation -> Region only from supplier.
+It has supernode risk, Nation has only 5 rels to Region, but each nation links to a fifth of all customers and suppliers — that's the supernode. Region is fine.
