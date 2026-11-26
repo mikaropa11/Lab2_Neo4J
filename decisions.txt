@@ -1,26 +1,19 @@
 query 1:
 Just one MATCH on LineItem with a filter. No relationships: it's pure single-table aggregation, nothing to
-traverse. Cypher groups implicitly by whatever non-aggregated values are in RETURN, so no GROUP BY is needed.
+traverse.
 
 query 2:
 Two steps: MATCH ... WITH p, min(sc.supplycost), then a second MATCH from the same p keeping only the
 suppliers with sc2.supplycost = min_cost. Cypher has no correlated scalar subquery like SQL, so aggregating
-in WITH and matching again is the idiomatic way. After WITH only p and min_cost stay in scope.
+in WITH and matching again is the correct way. After WITH only p and min_cost stay in scope.
 
 query 3:
 Customer -[:MAKES]-> Order -[:CONTAINS]-> LineItem, filtering segment, orderdate and shipdate.
 The SQL joins disappear into the path; only the business filters stay in WHERE.
-Grouping by o.id: l_orderkey is a foreign key, which in the graph is the CONTAINS relationship,
-so the order key is the id of the Order node.
 
 query 4:
 Region <-[:IN_REGION]- Nation <-[:CUSTOMER_IN]- Customer -[:MAKES]-> Order -[:CONTAINS]-> LineItem
 -[:SUPPLIED_BY]-> Supplier -[:SUPPLIER_IN]-> (the same Nation n).
 "c_nationkey = s_nationkey" is not a property comparison: the path closes on the same Nation node.
+Nation is a potential supernode because there are 25 nations and it's related to about 1,200 customers and 80 suppliers, so we directed the paths.
 
-supernodes:
-Each Nation has 1 relationship to its Region; each Region receives 5. Region is fine.
-Nation is the supernode: there are 25 nations, so each one links to about 1/25 of all customers and
-suppliers (about 1,200 CUSTOMER_IN and 80 SUPPLIER_IN at SF 0.2, x5 at SF 1).
-Mitigation: two relationship types (CUSTOMER_IN / SUPPLIER_IN) + direction, so a query only expands
-the relationships it needs (Q2 reads the 80 suppliers, not the 1,280 relationships).
