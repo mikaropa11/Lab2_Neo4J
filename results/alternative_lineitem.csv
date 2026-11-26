@@ -1,0 +1,13 @@
+phase,query,median_ms,min_ms,max_ms,db_hits
+no_index/node,q1,949.3,944.9,1035.9,9497663
+no_index/node,q3,171.2,167.0,208.2,810326
+no_index/node,q4,65.3,62.6,79.3,504194
+index/node,q1,1137.2,1110.7,1244.7,8280679
+index/node,q3,246.3,219.0,280.8,1042152
+index/node,q4,87.5,80.7,94.4,536545
+no_index/relationship,q1,1107.7,1074.1,1172.0,9497663
+no_index/relationship,q3,146.4,139.9,157.4,672716
+no_index/relationship,q4,59.2,51.8,61.4,355898
+index/relationship,q1,1583.0,1550.7,1633.8,8280679
+index/relationship,q3,259.4,226.9,283.1,904553
+index/relationship,q4,60.0,57.9,69.3,386595

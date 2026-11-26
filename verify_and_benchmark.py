@@ -90,11 +90,11 @@ def run_cypher(session, query, params):
             for record in session.run(query, params)]
 
 
-def verify(session, con):
+def verify(session, con, queries=CYPHER):
     print("Verification against DuckDB")
-    for q in CYPHER:
+    for q in queries:
         expected = [list(r) for r in con.execute(SQL[q].format(**PARAMS[q])).fetchall()]
-        got = run_cypher(session, CYPHER[q], PARAMS[q])
+        got = run_cypher(session, queries[q], PARAMS[q])
         status = "OK  " if same_rows(expected, got) else "DIFF"
         print(f"  {q}: {status} ({len(got)} rows in Neo4j, {len(expected)} in SQL)")
 
@@ -105,16 +105,16 @@ def db_hits(plan):
     return own + sum(db_hits(child) for child in plan.get("children", []))
 
 
-def time_queries(session, runs, phase):
+def time_queries(session, runs, phase, queries=CYPHER):
     rows = []
-    for q in CYPHER:
-        session.run(CYPHER[q], PARAMS[q]).consume()          # warm-up
+    for q in queries:
+        session.run(queries[q], PARAMS[q]).consume()         # warm-up
         times = []
         for _ in range(runs):
             start = time.perf_counter()
-            list(session.run(CYPHER[q], PARAMS[q]))          # fetch every row
+            list(session.run(queries[q], PARAMS[q]))         # fetch every row
             times.append((time.perf_counter() - start) * 1000)
-        result = session.run("PROFILE " + CYPHER[q], PARAMS[q])
+        result = session.run("PROFILE " + queries[q], PARAMS[q])
         list(result)                                         # PROFILE needs every row read
         hits = db_hits(result.consume().profile)
         median = statistics.median(times)
@@ -125,8 +125,8 @@ def time_queries(session, runs, phase):
     return rows
 
 
-def set_indexes(session, create):
-    for name, target in INDEXES.items():
+def set_indexes(session, create, indexes=INDEXES):
+    for name, target in indexes.items():
         if create:
             session.run(f"CREATE INDEX {name} IF NOT EXISTS {target}").consume()
         else:
