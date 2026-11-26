@@ -1,318 +1,172 @@
+"""
+Load the CSV files produced by transform_data.py into Neo4j.
+
+Graph model:
+
+    (:Region)<-[:IN_REGION]-(:Nation)
+    (:Nation)<-[:CUSTOMER_IN]-(:Customer)-[:MAKES]->(:Order)-[:CONTAINS]->(:LineItem)
+    (:LineItem)-[:SUPPLIED_BY]->(:Supplier)-[:SUPPLIER_IN]->(:Nation)
+    (:Supplier)-[:SUPPLIES {supplycost}]->(:Part)
+
+Connection settings come from a .env file:
+    NEO4J_URI=neo4j://localhost:7687
+    NEO4J_USERNAME=neo4j
+    NEO4J_PASSWORD=...
+    NEO4J_DATABASE=neo4j
+
+Usage:
+    python import_to_neo4j.py                 # load ./transformed-data
+    python import_to_neo4j.py --reset         # delete everything first
+"""
+import argparse
 import csv
 import os
-from dotenv import load_dotenv
 import sys
+import time
 from datetime import date
 from itertools import islice
 from pathlib import Path
 
+from dotenv import load_dotenv
 from neo4j import GraphDatabase
 
 load_dotenv()
 
-URI = os.getenv("NEO4J_URI")
-USERNAME = os.getenv("NEO4J_USERNAME")
+URI = os.getenv("NEO4J_URI", "neo4j://localhost:7687")
+USERNAME = os.getenv("NEO4J_USERNAME", "neo4j")
 PASSWORD = os.getenv("NEO4J_PASSWORD")
-DATABASE = os.getenv("NEO4J_DATABASE")
+DATABASE = os.getenv("NEO4J_DATABASE", "neo4j")
 
-CSV_DIR = Path(__file__).resolve().parent / "transformed-data"
 BATCH_SIZE = 25_000
 
+# Type of every property that is not text. "id" is always an integer.
+INTS = {"id", "start_id", "end_id", "size", "shippriority", "linenumber"}
+FLOATS = {"acctbal", "quantity", "extendedprice", "discount", "tax", "supplycost"}
+DATES = {"orderdate", "shipdate"}
 
-NODE_CONFIG = [
-    {
-        "label": "Part",
-        "file": "parts.csv",
-        "ints": {"P_PARTKEY", "P_SIZE"},
-        "floats": {"P_RETAILPRICE"},
-        "dates": set(),
-    },
-    {
-        "label": "Supplier",
-        "file": "suppliers.csv",
-        "ints": {"S_SUPPKEY", "S_NATIONKEY"},
-        "floats": {"S_ACCTBAL"},
-        "dates": set(),
-    },
-    {
-        "label": "Customer",
-        "file": "customers.csv",
-        "ints": {"C_CUSTKEY", "C_NATIONKEY"},
-        "floats": {"C_ACCTBAL"},
-        "dates": set(),
-    },
-    {
-        "label": "Order",
-        "file": "orders.csv",
-        "ints": {"O_ORDERKEY", "O_CUSTKEY", "O_SHIPPRIORITY"},
-        "floats": {"O_TOTALPRICE"},
-        "dates": {"O_ORDERDATE"},
-    },
-    {
-        "label": "LineItem",
-        "file": "lineitems.csv",
-        "ints": {"L_ORDERKEY", "L_PARTKEY", "L_SUPPKEY", "L_LINENUMBER"},
-        "floats": {"L_QUANTITY", "L_EXTENDEDPRICE", "L_DISCOUNT", "L_TAX"},
-        "dates": {"L_SHIPDATE", "L_COMMITDATE", "L_RECEIPTDATE"},
-    },
-    {
-        "label": "Nation",
-        "file": "nations.csv",
-        "ints": {"N_NATIONKEY", "N_REGIONKEY"},
-        "floats": set(),
-        "dates": set(),
-    },
-    {
-        "label": "Region",
-        "file": "regions.csv",
-        "ints": {"R_REGIONKEY"},
-        "floats": set(),
-        "dates": set(),
-    },
+NODES = [  # (label, file); small tables first
+    ("Region", "regions.csv"),
+    ("Nation", "nations.csv"),
+    ("Supplier", "suppliers.csv"),
+    ("Customer", "customers.csv"),
+    ("Part", "parts.csv"),
+    ("Order", "orders.csv"),
+    ("LineItem", "lineitems.csv"),
 ]
 
-RELATIONSHIP_CONFIG = [
-    {
-        "type": "PLACED",
-        "source": "Customer",
-        "target": "Order",
-        "file": "customer_placed_orders.csv",
-        "property_ints": set(),
-        "property_floats": set(),
-    },
-    {
-        "type": "CONTAINS",
-        "source": "Order",
-        "target": "LineItem",
-        "file": "order_contains_lineitems.csv",
-        "property_ints": set(),
-        "property_floats": set(),
-    },
-    {
-        "type": "SPECIFIES",
-        "source": "LineItem",
-        "target": "Part",
-        "file": "lineitem_specifies_parts.csv",
-        "property_ints": set(),
-        "property_floats": set(),
-    },
-    {
-        "type": "SOURCED_FROM",
-        "source": "LineItem",
-        "target": "Supplier",
-        "file": "lineitem_sourced_from_suppliers.csv",
-        "property_ints": set(),
-        "property_floats": set(),
-    },
-    {
-        "type": "SUPPLIED_BY",
-        "source": "Part",
-        "target": "Supplier",
-        "file": "part_supplied_by_supplier.csv",
-        "property_ints": {"PS_AVAILQTY"},
-        "property_floats": {"PS_SUPPLYCOST"},
-    },
-    {
-        "type": "LOCATED_IN",
-        "source": "Customer",
-        "target": "Nation",
-        "file": "customer_located_in_nation.csv",
-        "property_ints": set(),
-        "property_floats": set(),
-    },
-    {
-        "type": "LOCATED_IN",
-        "source": "Supplier",
-        "target": "Nation",
-        "file": "supplier_located_in_nation.csv",
-        "property_ints": set(),
-        "property_floats": set(),
-    },
-    {
-        "type": "BELONGS_TO",
-        "source": "Nation",
-        "target": "Region",
-        "file": "nation_belongs_to_region.csv",
-        "property_ints": set(),
-        "property_floats": set(),
-    },
+RELATIONSHIPS = [  # (type, source label, target label, file)
+    ("IN_REGION", "Nation", "Region", "nation_in_region.csv"),
+    ("CUSTOMER_IN", "Customer", "Nation", "customer_in_nation.csv"),
+    ("SUPPLIER_IN", "Supplier", "Nation", "supplier_in_nation.csv"),
+    ("MAKES", "Customer", "Order", "customer_makes_order.csv"),
+    ("CONTAINS", "Order", "LineItem", "order_contains_lineitem.csv"),
+    ("SUPPLIED_BY", "LineItem", "Supplier", "lineitem_supplied_by_supplier.csv"),
+    ("SUPPLIES", "Supplier", "Part", "supplier_supplies_part.csv"),
 ]
 
 
-def convert_row(row, ints, floats, dates):
-    """Convert CSV strings into Neo4j-compatible Python values."""
-    converted = {}
+def convert(row):
+    """CSV text -> Python values that Neo4j stores with the right type."""
+    result = {}
     for key, value in row.items():
-        if value is None or value == "":
-            converted[key] = None
-        elif key == "id" or key in {"start_id", "end_id"}:
-            converted[key] = value
-        elif key in ints:
-            converted[key] = int(value)
-        elif key in floats:
-            converted[key] = float(value)
-        elif key in dates:
-            converted[key] = date.fromisoformat(value)
+        if key in INTS:
+            result[key] = int(value)
+        elif key in FLOATS:
+            result[key] = float(value)
+        elif key in DATES:
+            result[key] = date.fromisoformat(value)   # stored as a Neo4j Date
         else:
-            converted[key] = value
-    return converted
+            result[key] = value
+    return result
 
 
-def batches(csv_path, batch_size):
-    with csv_path.open("r", encoding="utf-8", newline="") as source:
+def batches(path):
+    """Yield the rows of a CSV file in lists of BATCH_SIZE converted rows."""
+    with path.open("r", encoding="utf-8", newline="") as source:
         reader = csv.DictReader(source)
-        while True:
-            batch = list(islice(reader, batch_size))
-            if not batch:
-                break
-            yield batch
+        while batch := list(islice(reader, BATCH_SIZE)):
+            yield [convert(row) for row in batch]
 
 
 def create_constraints(session):
-    constraints = [
-        ("Part", "part_id"),
-        ("Supplier", "supplier_id"),
-        ("Customer", "customer_id"),
-        ("Order", "order_id"),
-        ("LineItem", "lineitem_id"),
-        ("Nation", "nation_id"),
-        ("Region", "region_id"),
-    ]
-    for label, name in constraints:
-        session.run(
-            f"CREATE CONSTRAINT {name} IF NOT EXISTS "
-            f"FOR (n:{label}) REQUIRE n.id IS UNIQUE"
-        ).consume()
-    print("Uniqueness constraints are in place.")
+    """One uniqueness constraint per label on `id`.
+
+    Neo4j creates an index for each one. They make the import fast (every
+    relationship looks up its two nodes by id), but none of the four queries
+    filters by id, so they do not affect the comparison without indexes.
+    """
+    for label, _ in NODES:
+        session.run(f"CREATE CONSTRAINT {label.lower()}_id IF NOT EXISTS "
+                    f"FOR (n:{label}) REQUIRE n.id IS UNIQUE").consume()
 
 
-def import_nodes(session, config):
-    csv_path = CSV_DIR / "nodes" / config["file"]
-    if not csv_path.is_file():
-        raise FileNotFoundError(f"Node CSV not found: {csv_path}")
-
-    label = config["label"]
+def import_nodes(session, label, path):
     query = f"""
     UNWIND $rows AS row
     MERGE (n:{label} {{id: row.id}})
     SET n += row
-    RETURN count(*) AS processed
     """
-
     total = 0
-    for raw_batch in batches(csv_path, BATCH_SIZE):
-        rows = [
-            convert_row(raw, config["ints"], config["floats"], config["dates"])
-            for raw in raw_batch
-        ]
-        result = session.execute_write(
-            lambda tx, data=rows: tx.run(query, rows=data).single()["processed"]
-        )
-        total += result
-        print(f"  {label}: {total:,} rows processed", end="\r", flush=True)
-
-    print(f"  {label}: {total:,} rows processed.")
-    return total
+    for rows in batches(path):
+        session.execute_write(lambda tx, data=rows: tx.run(query, rows=data).consume())
+        total += len(rows)
+        print(f"  {label}: {total:,}", end="\r", flush=True)
+    print(f"  {label}: {total:,} nodes")
 
 
-def import_relationships(session, config):
-    csv_path = CSV_DIR / "relationships" / config["file"]
-    if not csv_path.is_file():
-        raise FileNotFoundError(f"Relationship CSV not found: {csv_path}")
-
-    rel_type = config["type"]
-    source = config["source"]
-    target = config["target"]
-
-
+def import_relationships(session, rel_type, source, target, path):
+    # Only SUPPLIES has a property: the supply cost of the part-supplier pair.
+    set_properties = "SET r.supplycost = row.supplycost" if rel_type == "SUPPLIES" else ""
     query = f"""
     UNWIND $rows AS row
     MATCH (a:{source} {{id: row.start_id}})
     MATCH (b:{target} {{id: row.end_id}})
     MERGE (a)-[r:{rel_type}]->(b)
-    SET r += row.properties
-    RETURN count(*) AS processed
+    {set_properties}
+    RETURN count(*) AS matched
     """
-
-    total = 0
-    rows_seen = 0
-    for raw_batch in batches(csv_path, BATCH_SIZE):
-        rows_seen += len(raw_batch)
-        prepared = []
-        for raw in raw_batch:
-            properties = {}
-            for key, value in raw.items():
-                if key in {"start_id", "end_id"}:
-                    continue
-                if value == "":
-                    properties[key] = None
-                elif key in config["property_ints"]:
-                    properties[key] = int(value)
-                elif key in config["property_floats"]:
-                    properties[key] = float(value)
-                else:
-                    properties[key] = value
-            prepared.append({
-                "start_id": raw["start_id"],
-                "end_id": raw["end_id"],
-                "properties": properties,
-            })
-
-        processed = session.execute_write(
-            lambda tx, data=prepared: tx.run(query, rows=data).single()["processed"]
-        )
-        total += processed
-        print(f"  {rel_type} ({source}->{target}): {total:,} rows matched", end="\r", flush=True)
-
-    print(f"  {rel_type} ({source}->{target}): {total:,} rows matched.")
-    if total != rows_seen:
-        print(
-            f"  WARNING: {rows_seen - total:,} of {rows_seen:,} rows did not "
-            "match both endpoint nodes. Check the source IDs and import order.",
-            file=sys.stderr,
-        )
-    return total, rows_seen
+    total = matched = 0
+    for rows in batches(path):
+        matched += session.execute_write(
+            lambda tx, data=rows: tx.run(query, rows=data).single()["matched"])
+        total += len(rows)
+        print(f"  {rel_type}: {matched:,}", end="\r", flush=True)
+    print(f"  {rel_type} ({source}->{target}): {matched:,} relationships")
+    if matched != total:
+        print(f"  WARNING: {total - matched:,} rows did not find both nodes",
+              file=sys.stderr)
 
 
 def main():
-    if not CSV_DIR.is_dir():
-        raise FileNotFoundError(
-            f"Could not find {CSV_DIR}. Run transform_tpch.py first, "
-            "or place transformed-data beside this script."
-        )
+    parser = argparse.ArgumentParser(description="Load the TPC-H graph into Neo4j.")
+    parser.add_argument("--data", type=Path, default=Path("transformed-data"),
+                        help="folder created by transform_data.py")
+    parser.add_argument("--reset", action="store_true",
+                        help="delete all nodes and relationships first")
+    args = parser.parse_args()
+    if not PASSWORD:
+        sys.exit("Set NEO4J_PASSWORD in the .env file.")
 
     driver = GraphDatabase.driver(URI, auth=(USERNAME, PASSWORD))
+    start = time.perf_counter()
     try:
-        driver.verify_connectivity()
-        print(f"Connected to Neo4j at {URI}; database: {DATABASE}")
-
         with driver.session(database=DATABASE) as session:
+            if args.reset:
+                # Delete in small transactions, so a big graph fits in memory.
+                session.run("MATCH (n) CALL (n) { DETACH DELETE n } "
+                            "IN TRANSACTIONS OF 10000 ROWS").consume()
+                print("Database emptied.")
             create_constraints(session)
-
-            print("\nImporting nodes...")
-            node_total = 0
-            for config in NODE_CONFIG:
-                node_total += import_nodes(session, config)
-
-            print("\nImporting relationships...")
-            relationship_total = 0
-            relationship_rows = 0
-            for config in RELATIONSHIP_CONFIG:
-                imported, seen = import_relationships(session, config)
-                relationship_total += imported
-                relationship_rows += seen
-
-            print("\nImport summary")
-            print(f"  Node rows processed:         {node_total:,}")
-            print(f"  Relationship rows in CSVs:   {relationship_rows:,}")
-            print(f"  Relationships matched:      {relationship_total:,}")
-            if relationship_total == relationship_rows:
-                print("  All relationship endpoints matched successfully.")
-            else:
-                print("  Some relationships were skipped; inspect the warnings above.")
-
+            print("Nodes:")
+            for label, file_name in NODES:
+                import_nodes(session, label, args.data / "nodes" / file_name)
+            print("Relationships:")
+            for rel_type, source, target, file_name in RELATIONSHIPS:
+                import_relationships(session, rel_type, source, target,
+                                     args.data / "relationships" / file_name)
     finally:
         driver.close()
+    print(f"Done in {time.perf_counter() - start:.0f} s")
 
 
 if __name__ == "__main__":
