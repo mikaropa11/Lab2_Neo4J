@@ -1,15 +1,26 @@
 query 1:
-Just one MATCH on LineItem with a filter. No relationships. t's pure single-table aggregation, nothing to 
-traverse. Cypher groups implicitly by whatever non-aggregated stuff is in RETURN, so no GROUP BY needed.
+Just one MATCH on LineItem with a filter. No relationships: it's pure single-table aggregation, nothing to
+traverse. Cypher groups implicitly by whatever non-aggregated values are in RETURN, so no GROUP BY is needed.
 
 query 2:
-two steps: MATCH ... WITH p, min(ps.PS_SUPPLYCOST), then second MATCH re-joining on ps.PS_SUPPLYCOST = min_supply_cost
-because Cypher has no correlated scalar subquery like SQL, so aggregating in WITH and joining back is the idiomatic way. 
+Two steps: MATCH ... WITH p, min(sc.supplycost), then a second MATCH from the same p keeping only the
+suppliers with sc2.supplycost = min_cost. Cypher has no correlated scalar subquery like SQL, so aggregating
+in WITH and matching again is the idiomatic way. After WITH only p and min_cost stay in scope.
 
 query 3:
-Start from Customer filtered by segment -> PLACED -> Order (date filter) -> CONTAINS -> LineItem (date filter). Group by orderkey and o.
-We start filtering customer to prune the most before any expansion
+Customer -[:MAKES]-> Order -[:CONTAINS]-> LineItem, filtering segment, orderdate and shipdate.
+The SQL joins disappear into the path; only the business filters stay in WHERE.
+Grouping by o.id: l_orderkey is a foreign key, which in the graph is the CONTAINS relationship,
+so the order key is the id of the Order node.
 
 query 4:
-start from date-filtered Order, traverse to Customer and Supplier, check c.C_NATIONKEY = s.S_NATIONKEY as property comparison, and reach Nation -> Region only from supplier.
-It has supernode risk, Nation has only 5 rels to Region, but each nation links to a fifth of all customers and suppliers — that's the supernode. Region is fine.
+Region <-[:IN_REGION]- Nation <-[:CUSTOMER_IN]- Customer -[:MAKES]-> Order -[:CONTAINS]-> LineItem
+-[:SUPPLIED_BY]-> Supplier -[:SUPPLIER_IN]-> (the same Nation n).
+"c_nationkey = s_nationkey" is not a property comparison: the path closes on the same Nation node.
+
+supernodes:
+Each Nation has 1 relationship to its Region; each Region receives 5. Region is fine.
+Nation is the supernode: there are 25 nations, so each one links to about 1/25 of all customers and
+suppliers (about 1,200 CUSTOMER_IN and 80 SUPPLIER_IN at SF 0.2, x5 at SF 1).
+Mitigation: two relationship types (CUSTOMER_IN / SUPPLIER_IN) + direction, so a query only expands
+the relationships it needs (Q2 reads the 80 suppliers, not the 1,280 relationships).
